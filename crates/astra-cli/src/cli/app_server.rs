@@ -678,15 +678,22 @@ fn begin_turn(
     let bound_thread_id = state.thread_id.clone().ok_or_else(|| {
         AppServerFailure::turn_failed("turn/start requires thread/start or thread/resume")
     })?;
-    let thread_id = requested_thread_id.unwrap_or(bound_thread_id);
+    if requested_thread_id
+        .as_deref()
+        .is_some_and(|requested| requested != bound_thread_id.as_str())
+    {
+        return Err(AppServerFailure::turn_failed(
+            "turn/start threadId does not match the bound thread; use thread/resume to switch sessions",
+        ));
+    }
     let turn_developer_instructions =
         requested_developer_instructions.or_else(|| state.developer_instructions.clone());
     state.active_turn = Some(ActiveTurn {
-        thread_id: thread_id.clone(),
+        thread_id: bound_thread_id.clone(),
         turn_id: turn_id.to_string(),
         cancel,
     });
-    Ok((thread_id, turn_developer_instructions))
+    Ok((bound_thread_id, turn_developer_instructions))
 }
 
 fn set_thread_if_idle(
@@ -1841,26 +1848,50 @@ mod tests {
     }
 
     #[test]
-    fn admitted_turn_does_not_publish_requested_thread_before_durable_settlement() {
+    fn turn_start_rejects_mismatched_thread_without_mutating_binding() {
         let mut state = AppState {
             thread_id: Some("thread-before-turn".to_string()),
+            developer_instructions: Some("bound instructions".to_string()),
             ..Default::default()
         };
-        let (execution_thread_id, _) = begin_turn(
+        let failure = begin_turn(
             &mut state,
             Some("thread-requested-for-turn".to_string()),
-            "turn-that-will-fail",
+            "turn-mismatched",
+            Arc::new(CancellationToken::new()),
+            Some("unbound instructions".to_string()),
+        )
+        .expect_err("turn/start must not switch the bound session");
+
+        assert!(failure.message.contains("thread/resume"));
+        assert_eq!(state.thread_id.as_deref(), Some("thread-before-turn"));
+        assert_eq!(
+            state.developer_instructions.as_deref(),
+            Some("bound instructions")
+        );
+        assert!(state.active_turn.is_none());
+
+        let (execution_thread_id, instructions) = begin_turn(
+            &mut state,
+            Some("thread-before-turn".to_string()),
+            "turn-on-bound-thread",
             Arc::new(CancellationToken::new()),
             None,
         )
-        .expect("turn admission");
+        .expect("the matching threadId uses the established binding");
+        assert_eq!(execution_thread_id, "thread-before-turn");
+        assert_eq!(instructions.as_deref(), Some("bound instructions"));
 
-        assert_eq!(execution_thread_id, "thread-requested-for-turn");
-        assert_eq!(
-            state.thread_id.as_deref(),
-            Some("thread-before-turn"),
-            "admission selects execution authority but persistence settlement owns pointer publication"
-        );
+        state.active_turn = None;
+        let (execution_thread_id, _) = begin_turn(
+            &mut state,
+            None,
+            "turn-without-thread-id",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect("an omitted threadId also uses the established binding");
+        assert_eq!(execution_thread_id, "thread-before-turn");
     }
 
     #[test]
