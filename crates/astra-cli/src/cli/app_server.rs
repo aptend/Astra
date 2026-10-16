@@ -44,6 +44,7 @@ struct AppState {
 }
 
 struct ActiveTurn {
+    thread_id: String,
     turn_id: String,
     cancel: Arc<CancellationToken>,
 }
@@ -228,15 +229,25 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let thread_id = {
-                    let mut guard = state.lock().await;
-                    set_thread_if_idle(
-                        &mut guard,
-                        "thread/start",
-                        requested,
-                        developer_instructions(&params),
+                if requested.is_some() {
+                    write_response_error(
+                        &writer,
+                        id,
+                        "thread/start cannot select a session ID; use thread/resume",
                     )
+                    .await?;
+                    continue;
+                }
+                let token = match get_profile_and_token(ctx.auth_profile.as_deref()) {
+                    Ok((_, _, _, token)) => token,
+                    Err(error) => {
+                        write_response_error(&writer, id, &error).await?;
+                        continue;
+                    }
                 };
+                let thread_id =
+                    start_server_thread(&ctx.api, &token, &state, developer_instructions(&params))
+                        .await;
                 let thread_id = match thread_id {
                     Ok(thread_id) => thread_id,
                     Err(failure) => {
@@ -263,15 +274,14 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let thread_id = {
-                    let mut guard = state.lock().await;
-                    set_thread_if_idle(
-                        &mut guard,
-                        "thread/resume",
-                        Some(thread_id),
-                        developer_instructions(&params),
-                    )
-                };
+                let thread_id = resume_server_thread(
+                    &ctx.api,
+                    ctx.auth_profile.as_deref(),
+                    &state,
+                    thread_id,
+                    developer_instructions(&params),
+                )
+                .await;
                 let thread_id = match thread_id {
                     Ok(thread_id) => thread_id,
                     Err(failure) => {
@@ -382,11 +392,13 @@ pub(crate) async fn run_stdio_app_server(
             "turn/interrupt" => {
                 let turn_id = {
                     let guard = state.lock().await;
-                    if let Some(active) = guard.active_turn.as_ref() {
-                        active.cancel.cancel();
-                        Some(active.turn_id.clone())
-                    } else {
-                        None
+                    interrupt_matching_turn(&guard, &params)
+                };
+                let turn_id = match turn_id {
+                    Ok(turn_id) => turn_id,
+                    Err(error) => {
+                        write_response_error(&writer, id, &error).await?;
+                        continue;
                     }
                 };
                 if let Some(turn_id) = turn_id {
@@ -470,6 +482,15 @@ async fn run_turn(
     .await?;
 
     let (_, _, _, token) = get_profile_and_token(ctx.auth_profile.as_deref())?;
+    // The stdio entrypoint bypasses interactive startup, but its turns still
+    // advertise this checkout as an Edge executor. Register its stable
+    // materialization before asking the Server to admit a turn, as one-shot
+    // chat does.
+    crate::cli::edge_lifecycle::register_edge_once(&ctx.api, &token)
+        .await
+        .map_err(|error| {
+            AppServerFailure::turn_failed(format!("Edge registration failed before chat: {error}"))
+        })?;
     let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
     cli_context.select_model(params.get("model").and_then(Value::as_str));
     let model = params
@@ -654,12 +675,14 @@ fn begin_turn(
         ));
     }
 
-    let thread_id = requested_thread_id
-        .or_else(|| state.thread_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let bound_thread_id = state.thread_id.clone().ok_or_else(|| {
+        AppServerFailure::turn_failed("turn/start requires thread/start or thread/resume")
+    })?;
+    let thread_id = requested_thread_id.unwrap_or(bound_thread_id);
     let turn_developer_instructions =
         requested_developer_instructions.or_else(|| state.developer_instructions.clone());
     state.active_turn = Some(ActiveTurn {
+        thread_id: thread_id.clone(),
         turn_id: turn_id.to_string(),
         cancel,
     });
@@ -669,18 +692,102 @@ fn begin_turn(
 fn set_thread_if_idle(
     state: &mut AppState,
     method: &str,
-    requested_thread_id: Option<String>,
+    thread_id: String,
     requested_developer_instructions: Option<String>,
 ) -> Result<String, AppServerFailure> {
     if let Some(active) = state.active_turn.as_ref() {
         return Err(AppServerFailure::turn_conflict(method, &active.turn_id));
     }
-    let thread_id = requested_thread_id
-        .or_else(|| state.thread_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     state.thread_id = Some(thread_id.clone());
     state.developer_instructions = requested_developer_instructions;
     Ok(thread_id)
+}
+
+async fn start_server_thread(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    state: &Arc<Mutex<AppState>>,
+    developer_instructions: Option<String>,
+) -> Result<String, AppServerFailure> {
+    {
+        let guard = state.lock().await;
+        if let Some(active) = guard.active_turn.as_ref() {
+            return Err(AppServerFailure::turn_conflict(
+                "thread/start",
+                &active.turn_id,
+            ));
+        }
+    }
+    // Publish only a Server-issued identity. The old local UUID was not a
+    // session and made the first turn fail with "Session not found".
+    let session_id = crate::cli::slash::slash_state::create_server_session_identity(api, token)
+        .await
+        .map_err(AppServerFailure::turn_failed)?;
+    let mut guard = state.lock().await;
+    set_thread_if_idle(
+        &mut guard,
+        "thread/start",
+        session_id,
+        developer_instructions,
+    )
+}
+
+async fn resume_server_thread(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &Arc<Mutex<AppState>>,
+    session_id: String,
+    developer_instructions: Option<String>,
+) -> Result<String, AppServerFailure> {
+    {
+        let guard = state.lock().await;
+        if let Some(active) = guard.active_turn.as_ref() {
+            return Err(AppServerFailure::turn_conflict(
+                "thread/resume",
+                &active.turn_id,
+            ));
+        }
+    }
+    // Share the normal headless resume preflight: an ACK must mean that the
+    // canonical Server session and its ResumeBundle can actually be restored.
+    let routing = crate::cli::one_shot_session_routing::resolve_one_shot_session_routing(
+        api,
+        profile,
+        Some(session_id.clone()),
+        true,
+    )
+    .await
+    .map_err(AppServerFailure::turn_failed)?;
+    if routing.server_session_id.as_deref() != Some(session_id.as_str()) {
+        return Err(AppServerFailure::turn_failed(
+            "thread/resume did not return the requested Server session",
+        ));
+    }
+    let mut guard = state.lock().await;
+    set_thread_if_idle(
+        &mut guard,
+        "thread/resume",
+        session_id,
+        developer_instructions,
+    )
+}
+
+fn interrupt_matching_turn(state: &AppState, params: &Value) -> Result<Option<String>, String> {
+    let thread_id = requested_thread_id(params)?
+        .ok_or_else(|| "turn/interrupt missing threadId".to_string())?;
+    let turn_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "turn/interrupt missing turnId".to_string())?;
+    let Some(active) = state.active_turn.as_ref() else {
+        return Ok(None);
+    };
+    if active.thread_id != thread_id || active.turn_id != turn_id {
+        return Err("turn/interrupt target does not match the active turn".to_string());
+    }
+    active.cancel.cancel();
+    Ok(Some(active.turn_id.clone()))
 }
 
 fn publish_committed_session_authority(state: &mut AppState, failure: &AppServerFailure) {
@@ -1218,19 +1325,23 @@ mod tests {
         AppServerFailure, AppState, SESSION_COMMIT_UNKNOWN_CODE, SESSION_PERSISTENCE_FAILED_CODE,
         SESSION_PROJECTION_FAILED_CODE, TURN_CONFLICT_CODE, app_server_continuation,
         approval_response_from_params, begin_turn, explain_mode_from_params, extract_turn_message,
-        join_or_abort_app_server_task, next_thread_id_after_turn, permission_mode_from_params,
-        persist_app_server_turn, publish_committed_session_authority, register_pending_approval,
-        requested_thread_id, response_failure_value, set_thread_if_idle, stream_event_notification,
+        interrupt_matching_turn, join_or_abort_app_server_task, next_thread_id_after_turn,
+        permission_mode_from_params, persist_app_server_turn, publish_committed_session_authority,
+        register_pending_approval, requested_thread_id, response_failure_value,
+        resume_server_thread, set_thread_if_idle, start_server_thread, stream_event_notification,
         thread_started_params, turn_completed_params, turn_failed_params, turn_failure_params,
     };
     use crate::ExplainMode;
     use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::command_router::HeadlessCanonicalCommitStatus;
     use crate::cli::permission_manager::PermissionMode;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Barrier, Mutex, oneshot};
     use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn runtime_feedback_frame() -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
         serde_json::from_value(serde_json::json!({
@@ -1386,6 +1497,151 @@ mod tests {
         assert_eq!(params["turn"]["id"], "turn-1");
         assert_eq!(params["threadId"], "sess-123");
         assert_eq!(params["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn thread_start_binds_a_real_server_session_before_turn_admission() {
+        let server = MockServer::start().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": session_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState::default()));
+
+        let bound = start_server_thread(
+            &api,
+            "test-token",
+            &state,
+            Some("gateway instructions".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bound, session_id);
+        let guard = state.lock().await;
+        assert_eq!(guard.thread_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            guard.developer_instructions.as_deref(),
+            Some("gateway instructions")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn failed_thread_creation_preserves_the_current_thread() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+        assert!(
+            start_server_thread(&api, "test-token", &state, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn missing_server_resume_does_not_publish_a_stale_thread() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = MockServer::start().await;
+        let missing_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{missing_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+
+        assert!(
+            resume_server_thread(&api, Some("default"), &state, missing_id, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+        server.verify().await;
+    }
+
+    #[test]
+    fn interrupt_only_cancels_the_exact_active_thread_and_turn() {
+        let mut state = AppState {
+            thread_id: Some("session-1".to_string()),
+            ..Default::default()
+        };
+        let cancel = Arc::new(CancellationToken::new());
+        begin_turn(
+            &mut state,
+            Some("session-1".to_string()),
+            "turn-1",
+            cancel.clone(),
+            None,
+        )
+        .unwrap();
+        for params in [
+            serde_json::json!({"threadId": "other", "turnId": "turn-1"}),
+            serde_json::json!({"threadId": "session-1", "turnId": "old-turn"}),
+            serde_json::json!({"threadId": "session-1"}),
+        ] {
+            assert!(interrupt_matching_turn(&state, &params).is_err());
+            assert!(!cancel.is_cancelled());
+        }
+        let matched = interrupt_matching_turn(
+            &state,
+            &serde_json::json!({"threadId": "session-1", "turnId": "turn-1"}),
+        )
+        .unwrap();
+        assert_eq!(matched.as_deref(), Some("turn-1"));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn turn_start_rejects_an_unbound_thread() {
+        let mut state = AppState::default();
+        let failure = begin_turn(
+            &mut state,
+            None,
+            "turn-unbound",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect_err("an unbound turn must not invent a local session ID");
+        assert!(failure.message.contains("thread/start"));
+        assert!(state.active_turn.is_none());
     }
 
     #[tokio::test]
@@ -1555,7 +1811,7 @@ mod tests {
                 set_thread_if_idle(
                     &mut guard,
                     method,
-                    Some(format!("thread-rebind-{index}")),
+                    format!("thread-rebind-{index}"),
                     Some(format!("instructions-{index}")),
                 )
             }));
