@@ -5,6 +5,7 @@
 //! progress emitted as notifications.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -60,6 +61,8 @@ const SESSION_PROJECTION_FAILED_CODE: &str = "session_projection_failed";
 const SESSION_COMMIT_UNKNOWN_CODE: &str = "session_commit_unknown";
 const TURN_FAILED_CODE: &str = "turn_failed";
 const EDGE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
+// Leave headroom for gateway clients with a 30-second app-server RPC deadline.
+const SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AppServerFailure {
@@ -182,7 +185,16 @@ pub(crate) async fn run_stdio_app_server(
     let writer = JsonWriter;
     let stdin = std::io::stdin();
     let lines = stdin.lock().lines();
+    run_app_server_lines(lines, ctx, state, writer, SESSION_BIND_TIMEOUT).await
+}
 
+async fn run_app_server_lines(
+    lines: impl IntoIterator<Item = std::io::Result<String>>,
+    ctx: ServerContext,
+    state: Arc<Mutex<AppState>>,
+    writer: JsonWriter,
+    session_bind_timeout: Duration,
+) -> Result<(), String> {
     for line in lines {
         let line = line.map_err(|e| format!("stdin read failed: {e}"))?;
         let trimmed = line.trim();
@@ -246,9 +258,12 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let thread_id =
-                    start_server_thread(&ctx.api, &token, &state, developer_instructions(&params))
-                        .await;
+                let thread_id = with_thread_binding_deadline(
+                    "thread/start",
+                    session_bind_timeout,
+                    start_server_thread(&ctx.api, &token, &state, developer_instructions(&params)),
+                )
+                .await;
                 let thread_id = match thread_id {
                     Ok(thread_id) => thread_id,
                     Err(failure) => {
@@ -275,12 +290,16 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let thread_id = resume_server_thread(
-                    &ctx.api,
-                    ctx.auth_profile.as_deref(),
-                    &state,
-                    thread_id,
-                    developer_instructions(&params),
+                let thread_id = with_thread_binding_deadline(
+                    "thread/resume",
+                    session_bind_timeout,
+                    resume_server_thread(
+                        &ctx.api,
+                        ctx.auth_profile.as_deref(),
+                        &state,
+                        thread_id,
+                        developer_instructions(&params),
+                    ),
                 )
                 .await;
                 let thread_id = match thread_id {
@@ -735,6 +754,26 @@ fn set_thread_if_idle(
     state.thread_id = Some(thread_id.clone());
     state.developer_instructions = requested_developer_instructions;
     Ok(thread_id)
+}
+
+async fn with_thread_binding_deadline<F>(
+    method: &str,
+    deadline: Duration,
+    binding: F,
+) -> Result<String, AppServerFailure>
+where
+    F: Future<Output = Result<String, AppServerFailure>>,
+{
+    // The stdio reader awaits binding inline. Bound the entire operation,
+    // including response-body reads and resume hydration, so a stalled Server
+    // cannot prevent the reader from dispatching the next JSON-RPC request.
+    tokio::time::timeout(deadline, binding)
+        .await
+        .unwrap_or_else(|_| {
+            Err(AppServerFailure::turn_failed(format!(
+                "{method} timed out while binding the Server session"
+            )))
+        })
 }
 
 async fn start_server_thread(
@@ -1363,9 +1402,10 @@ mod tests {
         interrupt_matching_turn, join_or_abort_app_server_task, next_thread_id_after_turn,
         permission_mode_from_params, persist_app_server_turn, publish_committed_session_authority,
         register_edge_before_chat, register_pending_approval, requested_thread_id,
-        response_failure_value, resume_server_thread, set_thread_if_idle, start_server_thread,
-        stream_event_notification, thread_started_params, turn_completed_params,
-        turn_failed_params, turn_failure_params,
+        response_failure_value, resume_server_thread, run_app_server_lines, set_thread_if_idle,
+        start_server_thread, stream_event_notification, thread_started_params,
+        turn_completed_params, turn_failed_params, turn_failure_params,
+        with_thread_binding_deadline,
     };
     use crate::ExplainMode;
     use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
@@ -1374,6 +1414,7 @@ mod tests {
     use crate::cli::permission_manager::PermissionMode;
     use crate::test_utils::ProcessEnvGuard;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Barrier, Mutex, Notify, oneshot};
     use tokio_util::sync::CancellationToken;
@@ -1591,6 +1632,330 @@ mod tests {
         assert_eq!(
             state.lock().await.thread_id.as_deref(),
             Some("existing-session")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_thread_start_preserves_binding_and_allows_next_request() {
+        let server = MockServer::start().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response_attempts = attempts.clone();
+        let response_session_id = session_id.clone();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "session_id": response_session_id,
+                }));
+                if response_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    response.set_delay(Duration::from_secs(10))
+                } else {
+                    response
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            developer_instructions: Some("existing instructions".to_string()),
+            ..Default::default()
+        }));
+
+        let failure = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(1),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect_err("stalled session creation must time out");
+        assert!(failure.message.contains("thread/start timed out"));
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+        assert_eq!(
+            state.lock().await.developer_instructions.as_deref(),
+            Some("existing instructions")
+        );
+
+        let bound = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(2),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect("the next request must be processed after the timeout");
+        assert_eq!(bound, session_id);
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stalled_thread_resume_preflight_allows_next_request() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let resume_id = uuid::Uuid::new_v4().to_string();
+        let next_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{resume_id}")))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": next_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+
+        let failure = with_thread_binding_deadline(
+            "thread/resume",
+            Duration::from_secs(1),
+            resume_server_thread(&api, Some("default"), &state, resume_id, None),
+        )
+        .await
+        .expect_err("stalled resume preflight must time out");
+        assert!(failure.message.contains("thread/resume timed out"));
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+
+        let bound = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(2),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect("the next request must be processed after the timeout");
+        assert_eq!(bound, next_id);
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stalled_thread_resume_restore_allows_next_request() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let resume_id = uuid::Uuid::new_v4().to_string();
+        let next_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{resume_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": resume_id,
+                "turn_count": 1,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{resume_id}/resume")))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": next_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+
+        let failure = with_thread_binding_deadline(
+            "thread/resume",
+            Duration::from_secs(1),
+            resume_server_thread(&api, Some("default"), &state, resume_id, None),
+        )
+        .await
+        .expect_err("stalled restore must time out");
+        assert!(failure.message.contains("thread/resume timed out"));
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+
+        let bound = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(2),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect("the next request must be processed after the timeout");
+        assert_eq!(bound, next_id);
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stdio_reader_dispatches_next_start_after_stalled_start() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                account_id: Some("test-account".to_string()),
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response_attempts = attempts.clone();
+        let response_session_id = session_id.clone();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "session_id": response_session_id,
+                }));
+                if response_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    response.set_delay(Duration::from_secs(10))
+                } else {
+                    response
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let ctx = ServerContext {
+            api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            auth_profile: Some("default".to_string()),
+            default_model: None,
+            system_prompt: None,
+            auto_approve: false,
+        };
+        let lines = (1..=2).map(|id| {
+            Ok(serde_json::json!({"id": id, "method": "thread/start", "params": {}}).to_string())
+        });
+
+        run_app_server_lines(
+            lines,
+            ctx,
+            state.clone(),
+            JsonWriter,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the stdio reader must settle the timeout and dispatch the next line");
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stdio_reader_dispatches_next_start_after_stalled_resume() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                account_id: Some("test-account".to_string()),
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let resume_id = uuid::Uuid::new_v4().to_string();
+        let next_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{resume_id}")))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": next_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+        let ctx = ServerContext {
+            api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            auth_profile: Some("default".to_string()),
+            default_model: None,
+            system_prompt: None,
+            auto_approve: false,
+        };
+        let lines = vec![
+            Ok(serde_json::json!({
+                "id": 1,
+                "method": "thread/resume",
+                "params": {"threadId": resume_id},
+            })
+            .to_string()),
+            Ok(serde_json::json!({"id": 2, "method": "thread/start", "params": {}}).to_string()),
+        ];
+
+        run_app_server_lines(
+            lines,
+            ctx,
+            state.clone(),
+            JsonWriter,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the stdio reader must settle the timeout and dispatch the next line");
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some(next_id.as_str())
         );
         server.verify().await;
     }
