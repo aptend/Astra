@@ -59,6 +59,7 @@ const SESSION_PERSISTENCE_FAILED_CODE: &str = "session_persistence_failed";
 const SESSION_PROJECTION_FAILED_CODE: &str = "session_projection_failed";
 const SESSION_COMMIT_UNKNOWN_CODE: &str = "session_commit_unknown";
 const TURN_FAILED_CODE: &str = "turn_failed";
+const EDGE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AppServerFailure {
@@ -345,49 +346,20 @@ pub(crate) async fn run_stdio_app_server(
                 let task_state = state.clone();
                 let task_writer = writer.clone();
                 let task_thread_id = thread_id.clone();
-                tokio::spawn(async move {
-                    let result = run_turn(
-                        task_ctx,
-                        task_writer.clone(),
-                        TurnRequest {
-                            state: task_state.clone(),
-                            thread_id: task_thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            message,
-                            params,
-                            developer_instructions: turn_developer_instructions,
-                            permission_mode,
-                            cancel,
-                        },
-                    )
-                    .await;
-                    if let Err(failure) = result {
-                        let terminal_thread_id = failure
-                            .canonical_session_id
-                            .as_deref()
-                            .unwrap_or(&task_thread_id);
-                        let _ = write_notification(
-                            &task_writer,
-                            "error",
-                            turn_failure_params(&failure, &turn_id, terminal_thread_id),
-                        )
-                        .await;
-                        let _ = write_notification(
-                            &task_writer,
-                            "turn/completed",
-                            turn_failed_params(&turn_id, terminal_thread_id, &failure),
-                        )
-                        .await;
-                    }
-                    let mut guard = task_state.lock().await;
-                    if guard
-                        .active_turn
-                        .as_ref()
-                        .is_some_and(|active| active.turn_id == turn_id)
-                    {
-                        guard.active_turn = None;
-                    }
-                });
+                tokio::spawn(execute_turn_task(
+                    task_ctx,
+                    task_writer,
+                    TurnRequest {
+                        state: task_state,
+                        thread_id: task_thread_id,
+                        turn_id,
+                        message,
+                        params,
+                        developer_instructions: turn_developer_instructions,
+                        permission_mode,
+                        cancel,
+                    },
+                ));
             }
             "turn/interrupt" => {
                 let turn_id = {
@@ -443,6 +415,65 @@ pub(crate) async fn run_stdio_app_server(
     Ok(())
 }
 
+async fn execute_turn_task(ctx: ServerContext, writer: JsonWriter, request: TurnRequest) {
+    let state = request.state.clone();
+    let turn_id = request.turn_id.clone();
+    let thread_id = request.thread_id.clone();
+    if let Err(failure) = run_turn(ctx, writer.clone(), request).await {
+        let terminal_thread_id = failure
+            .canonical_session_id
+            .as_deref()
+            .unwrap_or(&thread_id);
+        let _ = write_notification(
+            &writer,
+            "error",
+            turn_failure_params(&failure, &turn_id, terminal_thread_id),
+        )
+        .await;
+        let _ = write_notification(
+            &writer,
+            "turn/completed",
+            turn_failed_params(&turn_id, terminal_thread_id, &failure),
+        )
+        .await;
+    }
+    let mut guard = state.lock().await;
+    if guard
+        .active_turn
+        .as_ref()
+        .is_some_and(|active| active.turn_id == turn_id)
+    {
+        guard.active_turn = None;
+    }
+}
+
+async fn register_edge_before_chat(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<(), AppServerFailure> {
+    tokio::select! {
+        // An interrupt wins a simultaneous registration response before chat starts.
+        biased;
+        _ = cancel.cancelled() => Err(AppServerFailure::turn_failed(
+            "Edge registration interrupted before chat",
+        )),
+        result = tokio::time::timeout(
+            timeout,
+            crate::cli::edge_lifecycle::register_edge_once(api, token),
+        ) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(AppServerFailure::turn_failed(format!(
+                "Edge registration failed before chat: {error}"
+            ))),
+            Err(_) => Err(AppServerFailure::turn_failed(
+                "Edge registration timed out before chat",
+            )),
+        },
+    }
+}
+
 async fn run_turn(
     ctx: ServerContext,
     writer: JsonWriter,
@@ -486,11 +517,7 @@ async fn run_turn(
     // advertise this checkout as an Edge executor. Register its stable
     // materialization before asking the Server to admit a turn, as one-shot
     // chat does.
-    crate::cli::edge_lifecycle::register_edge_once(&ctx.api, &token)
-        .await
-        .map_err(|error| {
-            AppServerFailure::turn_failed(format!("Edge registration failed before chat: {error}"))
-        })?;
+    register_edge_before_chat(&ctx.api, &token, &cancel, EDGE_REGISTRATION_TIMEOUT).await?;
     let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
     cli_context.select_model(params.get("model").and_then(Value::as_str));
     let model = params
@@ -1329,23 +1356,26 @@ async fn write_json_line(writer: &JsonWriter, value: Value) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerFailure, AppState, SESSION_COMMIT_UNKNOWN_CODE, SESSION_PERSISTENCE_FAILED_CODE,
-        SESSION_PROJECTION_FAILED_CODE, TURN_CONFLICT_CODE, app_server_continuation,
-        approval_response_from_params, begin_turn, explain_mode_from_params, extract_turn_message,
+        AppServerFailure, AppState, JsonWriter, SESSION_COMMIT_UNKNOWN_CODE,
+        SESSION_PERSISTENCE_FAILED_CODE, SESSION_PROJECTION_FAILED_CODE, ServerContext,
+        TURN_CONFLICT_CODE, TurnRequest, app_server_continuation, approval_response_from_params,
+        begin_turn, execute_turn_task, explain_mode_from_params, extract_turn_message,
         interrupt_matching_turn, join_or_abort_app_server_task, next_thread_id_after_turn,
         permission_mode_from_params, persist_app_server_turn, publish_committed_session_authority,
-        register_pending_approval, requested_thread_id, response_failure_value,
-        resume_server_thread, set_thread_if_idle, start_server_thread, stream_event_notification,
-        thread_started_params, turn_completed_params, turn_failed_params, turn_failure_params,
+        register_edge_before_chat, register_pending_approval, requested_thread_id,
+        response_failure_value, resume_server_thread, set_thread_if_idle, start_server_thread,
+        stream_event_notification, thread_started_params, turn_completed_params,
+        turn_failed_params, turn_failure_params,
     };
     use crate::ExplainMode;
     use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::command_router::HeadlessCanonicalCommitStatus;
     use crate::cli::permission_manager::PermissionMode;
+    use crate::test_utils::ProcessEnvGuard;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::{Barrier, Mutex, oneshot};
+    use tokio::sync::{Barrier, Mutex, Notify, oneshot};
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1634,6 +1664,127 @@ mod tests {
         .unwrap();
         assert_eq!(matched.as_deref(), Some("turn-1"));
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stalled_edge_registration_interrupt_releases_turn_and_session_lease() {
+        let _registry_guard = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                account_id: Some("test-account".to_string()),
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let request_seen = Arc::new(Notify::new());
+        let seen_by_mock = request_seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(move |_: &wiremock::Request| {
+                seen_by_mock.notify_one();
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(10))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session_id = format!("app-server-edge-register-{}", uuid::Uuid::new_v4());
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some(session_id.clone()),
+            ..Default::default()
+        }));
+        let cancel = Arc::new(CancellationToken::new());
+        begin_turn(
+            &mut *state.lock().await,
+            Some(session_id.clone()),
+            "turn-stalled",
+            cancel.clone(),
+            None,
+        )
+        .unwrap();
+        let task = tokio::spawn(execute_turn_task(
+            ServerContext {
+                api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                auth_profile: None,
+                default_model: None,
+                system_prompt: None,
+                auto_approve: false,
+            },
+            JsonWriter,
+            TurnRequest {
+                state: state.clone(),
+                thread_id: session_id.clone(),
+                turn_id: "turn-stalled".to_string(),
+                message: "hello".to_string(),
+                params: serde_json::json!({}),
+                developer_instructions: None,
+                permission_mode: PermissionMode::Auto,
+                cancel: cancel.clone(),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), request_seen.notified())
+            .await
+            .expect("Edge registration request should reach the Server");
+        assert!(matches!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id),
+            Err(astra_services::session_journal::SessionExecutionLeaseError::Conflict { .. })
+        ));
+
+        let matched = interrupt_matching_turn(
+            &*state.lock().await,
+            &serde_json::json!({"threadId": session_id, "turnId": "turn-stalled"}),
+        )
+        .unwrap();
+        assert_eq!(matched.as_deref(), Some("turn-stalled"));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("interrupted registration must settle promptly")
+            .unwrap();
+        assert!(state.lock().await.active_turn.is_none());
+        let lease =
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .expect("interrupted turn must release the session lease");
+        drop(lease);
+        begin_turn(
+            &mut *state.lock().await,
+            Some(session_id),
+            "turn-after-interrupt",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect("the next turn must be admitted");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stalled_edge_registration_has_a_finite_deadline() {
+        let _registry_guard = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let failure = register_edge_before_chat(
+            &api,
+            "test-token",
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("stalled registration must time out");
+        assert!(failure.message.contains("timed out"));
+        server.verify().await;
     }
 
     #[test]
